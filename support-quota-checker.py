@@ -1,7 +1,16 @@
 import boto3
+import json
 import re
 from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
+
+def load_accounts_from_json(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading JSON: {e}")
+        return []
 
 def assume_role(account_id, role_name):
     sts = boto3.client('sts')
@@ -42,12 +51,24 @@ def get_support_plan(session):
 def get_quota_from_support_cases(session):
     try:
         client = session.client('support', region_name='us-east-1')
-        six_months_ago = (datetime.utcnow() - timedelta(days=180)).isoformat()
-        cases = client.describe_cases(
-            includeResolvedCases=True,
-            afterTime=six_months_ago,
-            maxResults=100
-        )['cases']
+        two_years_ago = (datetime.utcnow() - timedelta(days=730)).isoformat()
+        
+        cases = []
+        next_token = None
+        while True:
+            params = {
+                'includeResolvedCases': True,
+                'afterTime': two_years_ago,
+                'maxResults': 100
+            }
+            if next_token:
+                params['nextToken'] = next_token
+
+            resp = client.describe_cases(**params)
+            cases.extend(resp.get('cases', []))
+            next_token = resp.get('nextToken')
+            if not next_token:
+                break
 
         max_found = None
         regex = re.compile(r'(?:increase|increased|set to|updated to|changed to)[^\d]{0,10}(\d{2,5})', re.IGNORECASE)
@@ -64,28 +85,38 @@ def get_quota_from_support_cases(session):
         return max_found
     except ClientError as e:
         if e.response['Error']['Code'] == 'SubscriptionRequiredException':
-            print("No support access (Basic plan).")
+            print("  No support access (Basic plan).")
             return None
-        print(f"Error scanning support cases: {e}")
+        print(f"  Error scanning support cases: {e}")
         return None
 
-# ---------- MAIN EXECUTION FOR TESTING ----------
-if __name__ == "__main__":
-    account_id = "533116124383"     # Replace with your test account ID
-    role_name = "Ergokrates-SSO-Role"  # Replace with role
+def main():
+    json_path = "accounts.json"  # Update if named differently
+    accounts = load_accounts_from_json(json_path)
+    if not accounts:
+        print("No valid accounts found.")
+        return
 
-    session = assume_role(account_id, role_name)
-    if not session:
-        exit(1)
+    for acct in accounts:
+        account_id = acct['account_id']
+        role_name = acct['role_name']
+        print(f"\n🔍 Processing account: {account_id}")
 
-    plan = get_support_plan(session)
-    print(f"Support plan for {account_id}: {plan}")
+        session = assume_role(account_id, role_name)
+        if not session:
+            continue
 
-    if plan in ['Business', 'Enterprise']:
-        quota = get_quota_from_support_cases(session)
-        if quota:
-            print(f"Manual quota found via support case: {quota}")
+        plan = get_support_plan(session)
+        print(f"  📦 Support plan: {plan}")
+
+        if plan in ['Business', 'Enterprise']:
+            quota = get_quota_from_support_cases(session)
+            if quota:
+                print(f"  ✅ Quota found via support case: {quota}")
+            else:
+                print("  ❌ No relevant quota update found in support cases.")
         else:
-            print("No relevant quota update found in support cases.")
-    else:
-        print("Support plan does not allow support case access.")
+            print("  ⚠️  Skipping support case scan (insufficient support plan)")
+
+if __name__ == "__main__":
+    main()
